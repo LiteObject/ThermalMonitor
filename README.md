@@ -21,13 +21,13 @@ A PowerShell script to monitor and log CPU/GPU usage, system temperatures, and p
 - **Windows 10/11:** GPU performance counters work best on modern Windows versions with supported GPUs and drivers.
 
 ## How to Use
-
-1. Save the script as `ThermalMonitor.ps1`.
+1. Download and save the script as `ThermalMonitor.ps1` to any directory of your choice.
 2. Open PowerShell as Administrator.
-3. Navigate to the script's directory (e.g., `cd C:\Scripts`).
+3. Navigate to the directory where you saved the script (e.g., `cd C:\Downloads` or `cd "C:\Your\Preferred\Path"`).
 4. Run the script: `.\ThermalMonitor.ps1`.
 5. Watch the progress indicators in the console.
 6. Check the log file in `C:\Temp` for detailed results.
+
 
 ## Interpreting the Log
 
