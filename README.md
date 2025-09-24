@@ -9,7 +9,7 @@ A PowerShell script to monitor and log CPU/GPU usage, system temperatures, and p
 - **Logs Data:** Saves output to a log file in `C:\Temp` with a timestamped filename (e.g., `ThermalMonitor_20250722_083512.log`).
 - **CPU Usage:** Uses performance counters to get real-time CPU usage percentage for the top 10 processes, with intelligent aggregation of multiple process instances and fallback to CPU time if counters aren't available.
 - **GPU Usage:** Attempts to retrieve GPU engine utilization using Windows performance counters with proper process name parsing and aggregation (availability varies by system and GPU).
-- **CPU Temperature:** Tries Open Hardware Monitor first with silent fallback to Windows built-in thermal zones. Includes temperature averaging and validation.
+- **CPU Temperature:** Tries Open Hardware Monitor first with silent fallback to Windows built-in thermal zones. Includes temperature averaging and validation. Displays temperatures in both Celsius and Fahrenheit for convenience.
 - **Process Tracking:** Maintains historical data for each process across all monitoring cycles to identify sustained heat sources.
 - **Heat Analysis:** Calculates a "heat score" for each process based on average CPU usage, peak usage, memory consumption, and time presence to identify the most likely culprits.
 - **Thermal Throttling Detection:** Compares current CPU clock speed to max clock speed and tracks throttling events throughout monitoring.
@@ -42,9 +42,10 @@ The script automatically generates a comprehensive heat analysis report at the e
 - **Color Coding:** Red indicates high heat scores (>50), yellow indicates moderate scores (>25)
 
 ### Temperature Analysis
-- **Temperature Averaging:** Shows average and maximum temperatures throughout the monitoring period
-- **High Temperature Warnings:** Alerts when temperatures exceed 85°C
+- **Temperature Averaging:** Shows average and maximum temperatures throughout the monitoring period in both Celsius and Fahrenheit
+- **High Temperature Warnings:** Alerts when temperatures exceed 85°C (185°F)
 - **Multiple Sources:** Uses Open Hardware Monitor data when available, falls back to Windows thermal zones
+- **Dual Scale Display:** All temperature readings are shown in both °C and °F for user convenience
 
 ### Throttling Detection
 - **Real-time Monitoring:** Tracks CPU clock speed changes throughout monitoring

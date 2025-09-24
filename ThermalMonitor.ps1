@@ -178,6 +178,12 @@ function Get-GpuUsage {
     }
 }
 
+# Helper function to convert Celsius to Fahrenheit
+function ConvertTo-Fahrenheit {
+    param($Celsius)
+    return [math]::Round(($Celsius * 9/5) + 32, 1)
+}
+
 # Enhanced temperature function with averaging
 function Get-CpuTemperature {
     $temperature = $null
@@ -189,11 +195,14 @@ function Get-CpuTemperature {
         
         if ($cpuTemps) {
             $avgTemp = ($cpuTemps | Measure-Object -Property Value -Average).Average
+            $maxTemp = ($cpuTemps | Measure-Object -Property Value -Maximum).Maximum
             $temperature = @{
                 Average = [math]::Round($avgTemp, 1)
-                Max = [math]::Round(($cpuTemps | Measure-Object -Property Value -Maximum).Maximum, 1)
+                AverageF = ConvertTo-Fahrenheit $avgTemp
+                Max = [math]::Round($maxTemp, 1)
+                MaxF = ConvertTo-Fahrenheit $maxTemp
                 Source = "OpenHardwareMonitor"
-                Details = $cpuTemps | Select-Object Name, Value
+                Details = $cpuTemps | Select-Object Name, Value, @{Name="ValueF";Expression={ConvertTo-Fahrenheit $_.Value}}
             }
         }
     } catch [System.Management.ManagementException] {
@@ -217,9 +226,12 @@ function Get-CpuTemperature {
                 
                 if ($temps) {
                     $avgTemp = ($temps | Measure-Object -Average).Average
+                    $maxTemp = ($temps | Measure-Object -Maximum).Maximum
                     $temperature = @{
                         Average = [math]::Round($avgTemp, 1)
-                        Max = [math]::Round(($temps | Measure-Object -Maximum).Maximum, 1)
+                        AverageF = ConvertTo-Fahrenheit $avgTemp
+                        Max = [math]::Round($maxTemp, 1)
+                        MaxF = ConvertTo-Fahrenheit $maxTemp
                         Source = "Windows Thermal Zones"
                         Details = "ACPI thermal zone data"
                     }
@@ -338,22 +350,26 @@ function Get-HeatCulprits {
         $maxSystemTemp = ($TemperatureHistory | Measure-Object -Maximum).Maximum
         
         Write-Host ""
-        Write-Host "🌡️ TEMPERATURE SUMMARY:" -ForegroundColor Cyan
-        $avgTempText = "   Average: $([math]::Round($avgSystemTemp, 1))°C"
+        Write-Host "TEMPERATURE SUMMARY:" -ForegroundColor Cyan
+        $avgTempC = [math]::Round($avgSystemTemp, 1)
+        $avgTempF = ConvertTo-Fahrenheit $avgTempC
+        $avgTempText = "   Average: $avgTempC°C ($avgTempF°F)"
         Write-Host $avgTempText -ForegroundColor White
-        $maxTempText = "   Maximum: $([math]::Round($maxSystemTemp, 1))°C"
+        $maxTempC = [math]::Round($maxSystemTemp, 1)
+        $maxTempF = ConvertTo-Fahrenheit $maxTempC
+        $maxTempText = "   Maximum: $maxTempC°C ($maxTempF°F)"
         Write-Host $maxTempText -ForegroundColor $(if ($maxSystemTemp -gt 85) { "Red" } else { "White" })
         
         Write-Log ""
         Write-Log "Temperature Summary:"
-        $avgTempLog = "  Average Temperature: $([math]::Round($avgSystemTemp, 1))°C"
+        $avgTempLog = "  Average Temperature: $avgTempC°C ($avgTempF°F)"
         Write-Log $avgTempLog
-        $maxTempLog = "  Maximum Temperature: $([math]::Round($maxSystemTemp, 1))°C"
+        $maxTempLog = "  Maximum Temperature: $maxTempC°C ($maxTempF°F)"
         Write-Log $maxTempLog
         
         if ($maxSystemTemp -gt 85) {
             Write-Host "   ⚠️ HIGH TEMPERATURE DETECTED!" -ForegroundColor Red
-            Write-Log "  WARNING: High temperature detected (greater than 85°C)"
+            Write-Log "  WARNING: High temperature detected (greater than 85°C / 185°F)"
         }
     } else {
         Write-Host ""
@@ -446,18 +462,18 @@ for ($i = 1; $i -le $iterations; $i++) {
     if ($cpuTemp) {
         Write-Log "CPU Temperature ($($cpuTemp.Source)):"
         $script:temperatureHistory += $cpuTemp.Average
-        $tempLogText = "  Average: $($cpuTemp.Average)°C, Max: $($cpuTemp.Max)°C"
+        $tempLogText = "  Average: $($cpuTemp.Average)°C ($($cpuTemp.AverageF)°F), Max: $($cpuTemp.Max)°C ($($cpuTemp.MaxF)°F)"
         Write-Log $tempLogText
         
         # Show temperature warning in console
         if ($cpuTemp.Average -gt 85) {
-            $highTempText = "`r⚠️ HIGH TEMP: $($cpuTemp.Average)°C"
+            $highTempText = "`rWARNING: HIGH TEMP: $($cpuTemp.Average)°C ($($cpuTemp.AverageF)°F)"
             Write-Host $highTempText -ForegroundColor Red
         }
         
         if ($cpuTemp.Details -and $cpuTemp.Details -isnot [string]) {
             $cpuTemp.Details | ForEach-Object {
-                $detailTempLogText = "  $($_.Name): $($_.Value)°C"
+                $detailTempLogText = "  $($_.Name): $($_.Value)°C ($($_.ValueF)°F)"
                 Write-Log $detailTempLogText
             }
         }
