@@ -9,6 +9,12 @@ if (-not (Test-Path $logDir)) {
     New-Item -ItemType Directory -Path $logDir
 }
 
+# Initialize tracking variables for heat analysis
+$script:processHistory = @{}
+$script:temperatureHistory = @()
+$script:throttleEvents = @()
+$script:gpuWarningShown = $false
+
 # Function to write to log file
 function Write-Log {
     param($Message)
@@ -33,91 +39,342 @@ function Show-SpinningCursor {
     Write-Host "`r$char Collecting data..." -NoNewline -ForegroundColor Yellow
 }
 
-# Function to get CPU usage by process
+# Function to get CPU usage by process with enhanced metrics
 function Get-TopCpuProcesses {
     try {
+        # Get performance counter data
         $cpuCounters = Get-Counter "\Process(*)\% Processor Time" -ErrorAction Stop
-        $processes = $cpuCounters.CounterSamples | 
-            Where-Object { $_.InstanceName -ne "_total" -and $_.InstanceName -ne "idle" -and $_.CookedValue -gt 0 } |
-            Sort-Object CookedValue -Descending |
-            Select-Object -First 5 |
-            Select-Object @{Name="Name";Expression={$_.InstanceName}}, @{Name="CPUPercent";Expression={[math]::Round($_.CookedValue,2)}}
+        $cpuCount = (Get-CimInstance Win32_ComputerSystem).NumberOfLogicalProcessors
+        
+        # Get all running processes for mapping
+        $runningProcesses = Get-Process
+        $processMap = @{}
+        
+        # Build process map by name (handle duplicates)
+        foreach ($proc in $runningProcesses) {
+            $key = $proc.Name
+            if (-not $processMap.ContainsKey($key)) {
+                $processMap[$key] = @()
+            }
+            $processMap[$key] += $proc
+        }
+        
+        # Process counter samples and normalize instance names
+        $processedData = @{}
+        foreach ($sample in $cpuCounters.CounterSamples) {
+            if ($sample.InstanceName -eq "_total" -or $sample.InstanceName -eq "idle") {
+                continue
+            }
+            
+            # Handle instance names with # (e.g., chrome#1, chrome#2)
+            $baseName = $sample.InstanceName -replace '#\d+$', ''
+            $normalizedCPU = [math]::Round($sample.CookedValue / $cpuCount, 2)
+            
+            if ($normalizedCPU -gt 0) {
+                if (-not $processedData.ContainsKey($baseName)) {
+                    $processedData[$baseName] = @{
+                        Name = $baseName
+                        CPUPercent = 0
+                        WorkingSetMB = 0
+                        ThreadCount = 0
+                        HandleCount = 0
+                        InstanceCount = 0
+                    }
+                }
+                
+                # Aggregate CPU usage for multiple instances
+                $processedData[$baseName].CPUPercent += $normalizedCPU
+                $processedData[$baseName].InstanceCount++
+            }
+        }
+        
+        # Add process details from Get-Process
+        foreach ($key in $processedData.Keys) {
+            if ($processMap.ContainsKey($key)) {
+                $procs = $processMap[$key]
+                # Sum up metrics for all instances of the same process
+                $totalMemory = ($procs | Measure-Object WorkingSet64 -Sum).Sum
+                $totalThreads = ($procs | Measure-Object { $_.Threads.Count } -Sum).Sum
+                $totalHandles = ($procs | Measure-Object HandleCount -Sum).Sum
+                
+                $processedData[$key].WorkingSetMB = [math]::Round($totalMemory / 1MB, 2)
+                $processedData[$key].ThreadCount = $totalThreads
+                $processedData[$key].HandleCount = $totalHandles
+            }
+        }
+        
+        # Convert to array and sort by CPU usage
+        $processes = $processedData.Values | 
+            Sort-Object CPUPercent -Descending |
+            Select-Object -First 10
+            
         return $processes
+        
     } catch {
-        # Fallback to process CPU time if performance counters fail
-        $processes = Get-Process | Where-Object { $_.CPU -gt 0 } | Sort-Object CPU -Descending | Select-Object -First 5 |
-            Select-Object Name, ID, @{Name="CPUTime";Expression={[math]::Round($_.CPU,2)}}
+        Write-Log "Error getting CPU performance counters: $_"
+        # Fallback method
+        $processes = Get-Process | Where-Object { $_.CPU -gt 0 } | 
+            Sort-Object CPU -Descending | 
+            Select-Object -First 10 |
+            Select-Object Name, ID, 
+                @{Name="CPUTime";Expression={[math]::Round($_.CPU,2)}}, 
+                @{Name="WorkingSetMB";Expression={[math]::Round($_.WorkingSet64/1MB,2)}},
+                @{Name="ThreadCount";Expression={$_.Threads.Count}}
         return $processes
     }
 }
 
-# Function to get GPU usage (requires Windows 10/11)
+# Function to get GPU usage with process mapping
 function Get-GpuUsage {
     try {
-        # Try modern GPU performance counters first
-        $gpuCounters = Get-Counter "\GPU Engine(*)\Utilization Percentage" -ErrorAction Stop
-        $gpuData = $gpuCounters.CounterSamples | 
-            Where-Object { $_.CookedValue -gt 0 } |
-            Sort-Object CookedValue -Descending |
-            Select-Object -First 5 |
-            Select-Object @{Name="Name";Expression={$_.InstanceName}}, @{Name="GPUPercent";Expression={[math]::Round($_.CookedValue,2)}}
-        return $gpuData
-    } catch {
-        try {
-            # Fallback to GPU process memory counters
-            $gpuData = Get-CimInstance -Namespace "root\cimv2" -ClassName Win32_PerfRawData_GPUPerformanceCounters_GPUEngine -ErrorAction Stop |
-                Where-Object { $_.Name -like "*engtype_3D*" } |
-                Select-Object -First 5 |
-                Select-Object Name, @{Name="GPUPercent";Expression={"Data not available"}}
-            return $gpuData
-        } catch {
+        # Check Windows version and GPU driver support
+        $osVersion = [System.Environment]::OSVersion.Version
+        if ($osVersion.Major -lt 10 -or ($osVersion.Major -eq 10 -and $osVersion.Build -lt 17763)) {
+            if (-not $script:gpuWarningShown) {
+                Write-Log "GPU monitoring requires Windows 10 build 17763 or higher"
+                $script:gpuWarningShown = $true
+            }
             return $null
         }
+        
+        # Try to get GPU usage per process
+        $gpuCounters = Get-Counter "\GPU Engine(*)\Utilization Percentage" -ErrorAction Stop
+        
+        $gpuData = $gpuCounters.CounterSamples | 
+            Where-Object { $_.CookedValue -gt 0 } |
+            ForEach-Object {
+                # Parse the instance name to extract process name
+                $instanceName = $_.InstanceName
+                $processName = if ($instanceName -match '^([^_]+)_') {
+                    $matches[1]
+                } else {
+                    $instanceName
+                }
+                
+                [PSCustomObject]@{
+                    Name = $processName
+                    GPUPercent = [math]::Round($_.CookedValue, 2)
+                    EngineType = if ($instanceName -match 'engtype_(\w+)') { $matches[1] } else { "Unknown" }
+                }
+            } |
+            Group-Object Name |
+            ForEach-Object {
+                [PSCustomObject]@{
+                    Name = $_.Name
+                    GPUPercent = [math]::Round(($_.Group | Measure-Object GPUPercent -Sum).Sum, 2)
+                }
+            } |
+            Sort-Object GPUPercent -Descending |
+            Select-Object -First 10
+        
+        return $gpuData
+        
+    } catch {
+        if (-not $script:gpuWarningShown) {
+            Write-Log "GPU counters unavailable: $_"
+            $script:gpuWarningShown = $true
+        }
+        return $null
     }
 }
 
-# Function to get CPU temperature (requires Open Hardware Monitor running)
+# Enhanced temperature function with averaging
 function Get-CpuTemperature {
+    $temperature = $null
+    
+    # Try Open Hardware Monitor first
     try {
-        # Try Open Hardware Monitor first
         $wmi = Get-WmiObject -Namespace "root\OpenHardwareMonitor" -Class Sensor -ErrorAction Stop
-        $cpuTemp = $wmi | Where-Object { $_.SensorType -eq "Temperature" -and $_.Name -like "*CPU*" } |
-            Select-Object Name, Value
-        if ($cpuTemp) {
-            return $cpuTemp
+        $cpuTemps = $wmi | Where-Object { $_.SensorType -eq "Temperature" -and $_.Name -like "*CPU*" }
+        
+        if ($cpuTemps) {
+            $avgTemp = ($cpuTemps | Measure-Object -Property Value -Average).Average
+            $temperature = @{
+                Average = [math]::Round($avgTemp, 1)
+                Max = [math]::Round(($cpuTemps | Measure-Object -Property Value -Maximum).Maximum, 1)
+                Source = "OpenHardwareMonitor"
+                Details = $cpuTemps | Select-Object Name, Value
+            }
+        }
+    } catch [System.Management.ManagementException] {
+        if ($_.Exception.Message -like "*Invalid namespace*") {
+            # Silently fall back to ACPI sensors
+        } else {
+            Write-Log "Error accessing Open Hardware Monitor: $_"
         }
     } catch {
-        # Try Windows built-in thermal zones as fallback
+        Write-Log "Unexpected error with Open Hardware Monitor: $_"
+    }
+    
+    # Fall back to Windows built-in thermal zones if no temperature data yet
+    if (-not $temperature) {
         try {
             $thermalZones = Get-WmiObject -Namespace "root\wmi" -Class MSAcpi_ThermalZoneTemperature -ErrorAction Stop
             if ($thermalZones) {
-                $tempData = $thermalZones | ForEach-Object {
-                    $tempC = [math]::Round(($_.CurrentTemperature / 10) - 273.15, 1)
-                    [PSCustomObject]@{
-                        Name = "Thermal Zone"
-                        Value = $tempC
+                $temps = $thermalZones | ForEach-Object {
+                    ($_.CurrentTemperature / 10) - 273.15
+                } | Where-Object { $_ -gt 0 -and $_ -lt 150 } # Filter out invalid readings
+                
+                if ($temps) {
+                    $avgTemp = ($temps | Measure-Object -Average).Average
+                    $temperature = @{
+                        Average = [math]::Round($avgTemp, 1)
+                        Max = [math]::Round(($temps | Measure-Object -Maximum).Maximum, 1)
+                        Source = "Windows Thermal Zones"
+                        Details = "ACPI thermal zone data"
                     }
                 }
-                return $tempData
             }
         } catch {
-            return "No temperature sensors accessible. Try running Open Hardware Monitor or check if thermal sensors are available."
+            # No temperature sensors accessible
         }
     }
-    return "Open Hardware Monitor not running and no accessible thermal sensors found"
+    
+    return $temperature
 }
 
-# Function to check for thermal throttling (basic check via CPU clock speed)
-function Check-ThermalThrottling {
+# Enhanced throttling detection
+function Test-ThermalThrottling {
     $cpu = Get-CimInstance Win32_Processor
     $currentClock = $cpu.CurrentClockSpeed
     $maxClock = $cpu.MaxClockSpeed
     $throttlePercent = [math]::Round(($currentClock / $maxClock) * 100, 2)
-    if ($throttlePercent -lt 80) {
-        return "Possible thermal throttling detected. Current clock: $currentClock MHz, Max clock: $maxClock MHz ($throttlePercent%)"
-    } else {
-        return "No significant throttling detected. Current clock: $currentClock MHz, Max clock: $maxClock MHz ($throttlePercent%)"
+    
+    return @{
+        IsThrottling = ($throttlePercent -lt 85)
+        CurrentClock = $currentClock
+        MaxClock = $maxClock
+        Percentage = $throttlePercent
     }
+}
+
+# Function to analyze and rank heat-causing processes
+function Get-HeatCulprits {
+    param(
+        $ProcessHistory,
+        $TemperatureHistory,
+        $ThrottleEvents,
+        $TotalIterations
+    )
+    
+    Write-Host ""
+    Write-Host "═══════════════════════════════════════════════" -ForegroundColor Red
+    Write-Host "           HEAT ANALYSIS REPORT                " -ForegroundColor Red
+    Write-Host "═══════════════════════════════════════════════" -ForegroundColor Red
+    Write-Host ""
+    
+    Write-Log ""
+    Write-Log "===== HEAT ANALYSIS REPORT ====="
+    
+    # Calculate average CPU usage per process
+    $processAverages = @{}
+    foreach ($process in $ProcessHistory.Keys) {
+        $avgCPU = if ($ProcessHistory[$process].CPU.Count -gt 0) {
+            ($ProcessHistory[$process].CPU | Measure-Object -Average).Average
+        } else { 0 }
+        
+        $maxCPU = if ($ProcessHistory[$process].CPU.Count -gt 0) {
+            ($ProcessHistory[$process].CPU | Measure-Object -Maximum).Maximum
+        } else { 0 }
+        
+        $avgMem = if ($ProcessHistory[$process].Memory.Count -gt 0) {
+            ($ProcessHistory[$process].Memory | Measure-Object -Average).Average
+        } else { 0 }
+        
+        $frequency = $ProcessHistory[$process].CPU.Count
+        $frequencyPercent = ($frequency / $TotalIterations) * 100
+        
+        # Improved heat score calculation:
+        # - Average CPU * duration factor (sustained load)
+        # - Peak CPU impact
+        # - Memory pressure consideration
+        $sustainedLoad = $avgCPU * ($frequencyPercent / 100)  # CPU% × time presence
+        $peakLoad = $maxCPU * 0.3  # Peak spikes matter less
+        $memoryPressure = [math]::Min($avgMem / 1000, 10)  # Cap memory contribution at 10 points
+        
+        $processAverages[$process] = @{
+            AvgCPU = [math]::Round($avgCPU, 2)
+            MaxCPU = [math]::Round($maxCPU, 2)
+            AvgMemoryMB = [math]::Round($avgMem, 2)
+            Frequency = $frequency
+            FrequencyPercent = [math]::Round($frequencyPercent, 1)
+            HeatScore = [math]::Round($sustainedLoad + $peakLoad + $memoryPressure, 2)
+        }
+    }
+    
+    # Sort by heat score
+    $topCulprits = $processAverages.GetEnumerator() | 
+        Where-Object { $_.Value.HeatScore -gt 0 } |
+        Sort-Object { $_.Value.HeatScore } -Descending | 
+        Select-Object -First 5
+    
+    Write-Host "🔥 TOP HEAT-CAUSING PROCESSES:" -ForegroundColor Yellow
+    Write-Log "Top Heat-Causing Processes (ranked by heat score):"
+    
+    $rank = 1
+    foreach ($culprit in $topCulprits) {
+        $color = if ($culprit.Value.HeatScore -gt 50) { "Red" } 
+                 elseif ($culprit.Value.HeatScore -gt 25) { "Yellow" } 
+                 else { "White" }
+                 
+        Write-Host "  $rank. $($culprit.Key)" -ForegroundColor $color
+        $heatScoreText = "     Heat Score: $($culprit.Value.HeatScore) | Avg CPU: $($culprit.Value.AvgCPU)% | Max CPU: $($culprit.Value.MaxCPU)%"
+        Write-Host $heatScoreText -ForegroundColor $color
+        $memoryText = "     Memory: $($culprit.Value.AvgMemoryMB) MB | Present: $($culprit.Value.FrequencyPercent)% of time"
+        Write-Host $memoryText -ForegroundColor Gray
+        
+        Write-Log "  $rank. $($culprit.Key) - Heat Score: $($culprit.Value.HeatScore)"
+        $avgCpuLogText = "     Average CPU: $($culprit.Value.AvgCPU)%, Max CPU: $($culprit.Value.MaxCPU)%"
+        Write-Log $avgCpuLogText
+        Write-Log "     Average Memory: $($culprit.Value.AvgMemoryMB) MB"
+        $presenceLogText = "     Presence: $($culprit.Value.Frequency)/$TotalIterations cycles ($($culprit.Value.FrequencyPercent)%)"
+        Write-Log $presenceLogText
+        $rank++
+    }
+    
+    # Temperature analysis
+    if ($TemperatureHistory.Count -gt 0) {
+        $avgSystemTemp = ($TemperatureHistory | Measure-Object -Average).Average
+        $maxSystemTemp = ($TemperatureHistory | Measure-Object -Maximum).Maximum
+        
+        Write-Host ""
+        Write-Host "🌡️ TEMPERATURE SUMMARY:" -ForegroundColor Cyan
+        $avgTempText = "   Average: $([math]::Round($avgSystemTemp, 1))°C"
+        Write-Host $avgTempText -ForegroundColor White
+        $maxTempText = "   Maximum: $([math]::Round($maxSystemTemp, 1))°C"
+        Write-Host $maxTempText -ForegroundColor $(if ($maxSystemTemp -gt 85) { "Red" } else { "White" })
+        
+        Write-Log ""
+        Write-Log "Temperature Summary:"
+        $avgTempLog = "  Average Temperature: $([math]::Round($avgSystemTemp, 1))°C"
+        Write-Log $avgTempLog
+        $maxTempLog = "  Maximum Temperature: $([math]::Round($maxSystemTemp, 1))°C"
+        Write-Log $maxTempLog
+        
+        if ($maxSystemTemp -gt 85) {
+            Write-Host "   ⚠️ HIGH TEMPERATURE DETECTED!" -ForegroundColor Red
+            Write-Log "  WARNING: High temperature detected (greater than 85°C)"
+        }
+    } else {
+        Write-Host ""
+        Write-Host "🌡️ No temperature data available" -ForegroundColor Gray
+        Write-Log "No temperature sensors accessible during monitoring"
+    }
+    
+    # Throttling analysis
+    if ($ThrottleEvents.Count -gt 0) {
+        $throttleRate = [math]::Round(($ThrottleEvents.Count / $TotalIterations) * 100, 1)
+        Write-Host ""
+        $throttleMessage = "⚡ THROTTLING EVENTS: $($ThrottleEvents.Count)/$TotalIterations cycles ($throttleRate%)"
+        Write-Host $throttleMessage -ForegroundColor $(if ($throttleRate -gt 50) { "Red" } else { "Yellow" })
+        Write-Log ""
+        $throttleLogMessage = "Throttling Events: $($ThrottleEvents.Count)/$TotalIterations cycles ($throttleRate%)"
+        Write-Log $throttleLogMessage
+    }
+    
+    Write-Host ""
+    Write-Host "═══════════════════════════════════════════════" -ForegroundColor Red
+    Write-Log "===== END OF HEAT ANALYSIS ====="
 }
 
 # Main monitoring loop
@@ -133,9 +390,9 @@ Write-Host ""
 
 Write-Log "Starting thermal monitoring..."
 
-$monitorDuration = 300 # Monitor for 5 minutes (300 seconds)
-$interval = 10 # Check every 10 seconds
-$iterations = [math]::Ceiling($monitorDuration / $interval)
+$script:monitorDuration = 300 # Monitor for 5 minutes (300 seconds)
+$script:interval = 10 # Check every 10 seconds
+$script:iterations = [math]::Ceiling($monitorDuration / $interval)
 
 for ($i = 1; $i -le $iterations; $i++) {
     # Show progress
@@ -150,59 +407,92 @@ for ($i = 1; $i -le $iterations; $i++) {
     
     # Get CPU usage
     $cpuProcesses = Get-TopCpuProcesses
-    Write-Log "Top 5 CPU-consuming processes:"
+    Write-Log "Top CPU-consuming processes:"
     if ($cpuProcesses) {
-        $cpuProcesses | ForEach-Object {
+        $cpuProcesses | Select-Object -First 5 | ForEach-Object {
+            # Track process history for heat analysis
+            if (-not $script:processHistory.ContainsKey($_.Name)) {
+                $script:processHistory[$_.Name] = @{ CPU = @(); Memory = @(); GPU = @() }
+            }
+            
             if ($_.CPUPercent) {
-                Write-Log "Process: $($_.Name), CPU Usage: $($_.CPUPercent)%"
+                $script:processHistory[$_.Name].CPU += $_.CPUPercent
+                $script:processHistory[$_.Name].Memory += $_.WorkingSetMB
+                $processLogText = "  Process: $($_.Name), CPU: $($_.CPUPercent)%, Memory: $($_.WorkingSetMB)MB, Threads: $($_.ThreadCount)"
+                Write-Log $processLogText
             } else {
-                Write-Log "Process: $($_.Name), PID: $($_.ID), CPU Time: $($_.CPUTime)s"
+                Write-Log "  Process: $($_.Name), PID: $($_.ID), CPU Time: $($_.CPUTime)s, Memory: $($_.WorkingSetMB)MB"
             }
         }
-    } else {
-        Write-Log "No CPU process data available"
     }
 
     # Get GPU usage
     $gpuUsage = Get-GpuUsage
-    Write-Log "GPU usage information:"
     if ($gpuUsage) {
-        $gpuUsage | ForEach-Object {
-            if ($_.GPUPercent -is [string]) {
-                Write-Log "GPU Engine: $($_.Name), Status: $($_.GPUPercent)"
-            } else {
-                Write-Log "GPU Engine: $($_.Name), Usage: $($_.GPUPercent)%"
+        Write-Log "GPU usage information:"
+        $gpuUsage | Select-Object -First 5 | ForEach-Object {
+            $gpuProcessLogText = "  Process: $($_.Name), GPU Usage: $($_.GPUPercent)%"
+            Write-Log $gpuProcessLogText
+            
+            # Track GPU usage in process history
+            if ($script:processHistory.ContainsKey($_.Name)) {
+                $script:processHistory[$_.Name].GPU += $_.GPUPercent
             }
         }
-    } else {
-        Write-Log "No GPU usage data available (GPU performance counters not supported on this system)"
     }
 
     # Get CPU temperature
     $cpuTemp = Get-CpuTemperature
-    Write-Log "CPU Temperature:"
-    if ($cpuTemp -is [string]) {
-        Write-Log $cpuTemp
-    } else {
-        $cpuTemp | ForEach-Object {
-            Write-Log "$($_.Name): $($_.Value)°C"
+    if ($cpuTemp) {
+        Write-Log "CPU Temperature ($($cpuTemp.Source)):"
+        $script:temperatureHistory += $cpuTemp.Average
+        $tempLogText = "  Average: $($cpuTemp.Average)°C, Max: $($cpuTemp.Max)°C"
+        Write-Log $tempLogText
+        
+        # Show temperature warning in console
+        if ($cpuTemp.Average -gt 85) {
+            $highTempText = "`r⚠️ HIGH TEMP: $($cpuTemp.Average)°C"
+            Write-Host $highTempText -ForegroundColor Red
         }
+        
+        if ($cpuTemp.Details -and $cpuTemp.Details -isnot [string]) {
+            $cpuTemp.Details | ForEach-Object {
+                $detailTempLogText = "  $($_.Name): $($_.Value)°C"
+                Write-Log $detailTempLogText
+            }
+        }
+    } else {
+        Write-Log "No temperature sensors accessible"
     }
 
     # Check for throttling
-    $throttleStatus = Check-ThermalThrottling
-    Write-Log $throttleStatus
+    $throttleStatus = Test-ThermalThrottling
+    if ($throttleStatus.IsThrottling) {
+        $script:throttleEvents += $i
+        $throttleLogText = "THROTTLING DETECTED: Current clock: $($throttleStatus.CurrentClock) MHz, Max: $($throttleStatus.MaxClock) MHz ($($throttleStatus.Percentage)%)"
+        Write-Log $throttleLogText
+        $throttleConsoleText = "`r⚡ Throttling detected at $($throttleStatus.Percentage)%"
+        Write-Host $throttleConsoleText -ForegroundColor Yellow
+    } else {
+        $noThrottleLogText = "No throttling: Current clock: $($throttleStatus.CurrentClock) MHz ($($throttleStatus.Percentage)% of max)"
+        Write-Log $noThrottleLogText
+    }
 
     # Clear the spinning cursor and show completion
     Write-Host "`rCycle $i/$iterations completed ✓" -ForegroundColor Green
     
-    # Wait for the next interval (minus the time already spent)
+    # Wait for the next interval
     if ($i -lt $iterations) {
-        Start-Sleep -Seconds ($interval - 1)  # -1 because we already slept for 0.5 seconds
+        Start-Sleep -Seconds ($interval - 1)
     }
 }
 
+# Analyze and report heat culprits
+Get-HeatCulprits -ProcessHistory $script:processHistory -TemperatureHistory $script:temperatureHistory -ThrottleEvents $script:throttleEvents -TotalIterations $script:iterations
+
+Write-Log ""
 Write-Log "Monitoring complete. Log saved to $logFile"
+
 Write-Host ""
 Write-Host "===============================================" -ForegroundColor Green
 Write-Host "         MONITORING COMPLETED! ✓              " -ForegroundColor Green
